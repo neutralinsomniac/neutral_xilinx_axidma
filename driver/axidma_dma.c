@@ -397,8 +397,6 @@ int axidma_read_transfer(struct axidma_device *dev,
         axidma_err("Could not prepare RX transfer chan %d", trans->channel_id);
         return rc;
     }
-    axidma_info("RX transfer setup chan %d", trans->channel_id);
-
     // Submit the receive transfer, and wait for it to complete
     rc = axidma_start_transfer(rx_chan, &rx_tfr);
     if (rc < 0) {
@@ -450,7 +448,6 @@ int axidma_write_transfer(struct axidma_device *dev,
         axidma_err("Could not prepare TX transfer chan %d", trans->channel_id);
         return rc;
     }
-    axidma_info("TX transfer setup chan %d", trans->channel_id);
 
     // Submit the transmit transfer, and wait for it to complete
     rc = axidma_start_transfer(tx_chan, &tx_tfr);
@@ -635,7 +632,7 @@ int axidma_get_residue(struct axidma_device *dev, struct axidma_residue *res)
 
         return 0;
     }
-    
+
     return -ENODEV;
 }
 

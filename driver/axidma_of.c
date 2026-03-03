@@ -47,9 +47,9 @@ static int axidma_parse_compatible_property(struct device_node *dma_chan_node,
         chan->dir = AXIDMA_READ;
         dev->num_vdma_rx_chans += 1;
     } else if (of_find_property(np, "compatible", NULL) == NULL) {
-        axidma_node_err(np, "DMA channel lacks 'compatible' property.\n");
+        printk(KERN_ERR "DMA channel lacks 'compatible' property.\n");
     } else {
-        axidma_node_err(np, "DMA channel has an invalid 'compatible' "
+        printk(KERN_ERR "DMA channel has an invalid 'compatible' "
                         "property.\n");
         axidma_err("The 'compatible' property must be one of: {"
                    "xlnx,axi-dma-mm2s-channel, xlnx,axi-dma-mm2s-channel, "
@@ -69,13 +69,30 @@ static int axidma_of_parse_dma_name(struct device_node *driver_node, int index,
     rc = of_property_read_string_index(driver_node, "dma-names", index,
                                        &chan->name);
     if (rc < 0) {
-        axidma_node_err(driver_node, "Unable to read DMA name %d from the "
+        printk(KERN_ERR "Unable to read DMA name %d from the "
                         "'dma-names' property.\n", index);
         return -EINVAL;
     }
 
     return 0;
 }
+
+static int axidma_of_parse_chrdev_name(struct device_node *driver_node,
+                                    struct axidma_device *dev)
+{
+    int rc;
+
+    // Parse the character device name from the 'chrdev-name' property
+    rc = of_property_read_string(driver_node, "chrdev-name", (const char**)&dev->chrdev_name);
+    if (rc < 0) {
+        axidma_node_err(driver_node, "Unable to read name from the "
+                        "'chrdev-name' property.\n");
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
 
 static int axidma_of_parse_channel(struct device_node *dma_node, int channel,
         struct axidma_chan *chan, struct axidma_device *dev)
@@ -86,29 +103,27 @@ static int axidma_of_parse_channel(struct device_node *dma_node, int channel,
 
     // Verify that the DMA node has two channel (child) nodes, one for TX and RX
     if (of_get_child_count(dma_node) < 1) {
-        axidma_node_err(dma_node, "DMA does not have any channel nodes.\n");
+        printk(KERN_ERR "DMA does not have any channel nodes.\n");
         return -EINVAL;
     } else if (of_get_child_count(dma_node) > 2) {
-        axidma_node_err(dma_node, "DMA has more than two channel nodes.\n");
+        printk(KERN_ERR "DMA has more than two channel nodes.\n");
         return -EINVAL;
     }
 
     // Go to the child node that we're parsing
     dma_chan_node = of_get_next_child(dma_node, NULL);
-    if (channel == 1) {
-        dma_chan_node = of_get_next_child(dma_node, dma_chan_node);
-    }
 
     // Check if the specified node exists
     if (dma_chan_node == NULL) {
-        axidma_node_err(dma_chan_node, "Unable to find child node number %d.\n",
+        printk(KERN_ERR "Unable to find child node number %d.\n",
                 channel);
+        return -EINVAL;
     }
 
     // Read out the channel's unique device id, and put it in the structure
     if (of_find_property(dma_chan_node, "xlnx,device-id", NULL) == NULL) {
-        axidma_node_err(dma_chan_node, "DMA channel is missing the "
-                        "'xlnx,device-id' property.\n");
+        printk(KERN_INFO "inside error case!\n");
+        printk(KERN_ERR "DMA channel is missing xlnx,device-id");
         return -EINVAL;
     }
 
@@ -165,36 +180,36 @@ int axidma_of_num_channels(struct platform_device *pdev)
 
     // Check that the device tree node has the 'dmas' and 'dma-names' properties
     if (of_find_property(driver_node, "dma-names", NULL) == NULL) {
-        axidma_node_err(driver_node, "Property 'dma-names' is missing.\n");
+        printk(KERN_ERR "Property 'dma-names' is missing.\n");
         return -EINVAL;
     } else if (of_find_property(driver_node, "dmas", NULL) == NULL) {
-        axidma_node_err(driver_node, "Property 'dmas' is missing.\n");
+        printk(KERN_ERR "Property 'dmas' is missing.\n");
         return -EINVAL;
     }
 
     // Get the length of the properties, and make sure they are not empty
     num_dma_names = of_property_count_strings(driver_node, "dma-names");
     if (num_dma_names < 0) {
-        axidma_node_err(driver_node, "Unable to get the 'dma-names' property "
+        printk(KERN_ERR "Unable to get the 'dma-names' property "
                         "length.\n");
         return -EINVAL;
     } else if (num_dma_names == 0) {
-        axidma_node_err(driver_node, "'dma-names' property is empty.\n");
+        printk(KERN_ERR "'dma-names' property is empty.\n");
         return -EINVAL;
     }
     num_dmas = of_count_phandle_with_args(driver_node, "dmas", "#dma-cells");
     if (num_dmas < 0) {
-        axidma_node_err(driver_node, "Unable to get the 'dmas' property "
+        printk(KERN_ERR "Unable to get the 'dmas' property "
                         "length.\n");
         return -EINVAL;
     } else if (num_dmas == 0) {
-        axidma_node_err(driver_node, "'dmas' property is empty.\n");
+        printk(KERN_ERR "'dmas' property is empty.\n");
         return -EINVAL;
     }
 
     // Check that the number of entries in each property matches
     if (num_dma_names != num_dmas) {
-        axidma_node_err(driver_node, "Length of 'dma-names' and 'dmas' "
+        printk(KERN_ERR "Length of 'dma-names' and 'dmas' "
                         "properties differ.\n");
         return -EINVAL;
     }
@@ -223,8 +238,14 @@ int axidma_of_parse_dma_nodes(struct platform_device *pdev,
 
     if (rc < 0) {
         if (rc != -EINVAL)
-            axidma_node_err(driver_node, "Invalid index property, ignoring.\n");
+            printk(KERN_ERR "Invalid index property, ignoring.\n");
         dev->chrdev_index = -1;
+    }
+
+    // Get the character device name
+    rc = axidma_of_parse_chrdev_name(driver_node, dev);
+    if (rc < 0) {
+        return rc;
     }
 
     /* For each DMA channel specified in the device tree, parse out the
@@ -235,7 +256,7 @@ int axidma_of_parse_dma_nodes(struct platform_device *pdev,
         rc = of_parse_phandle_with_args(driver_node, "dmas", "#dma-cells", i,
                                         &phandle_args);
         if (rc < 0) {
-            axidma_node_err(driver_node, "Unable to get phandle %d from the "
+            printk(KERN_ERR "Unable to get phandle %d from the "
                             "'dmas' property.\n", i);
             return rc;
         }
@@ -244,23 +265,23 @@ int axidma_of_parse_dma_nodes(struct platform_device *pdev,
         dma_node = phandle_args.np;
         channel = phandle_args.args[0];
         if (phandle_args.args_count < 1) {
-            axidma_node_err(driver_node, "Phandle %d in the 'dmas' property is "
+            printk(KERN_ERR "Phandle %d in the 'dmas' property is "
                             "is missing the channel direciton argument.\n", i);
             return -EINVAL;
         } else if (channel != 0 && channel != 1) {
-            axidma_node_err(driver_node, "Phandle %d in the 'dmas' property "
+            printk(KERN_ERR "Phandle %d in the 'dmas' property "
                             "has an invalid channel (argument 0).\n", i);
             return -EINVAL;
         }
 
-        // Parse out the information about the channel
-        rc = axidma_of_parse_channel(dma_node, channel, &dev->channels[i], dev);
+        // Parse the name of the channel
+        rc = axidma_of_parse_dma_name(driver_node, i, &dev->channels[i]);
         if (rc < 0) {
             return rc;
         }
 
-        // Parse the name of the channel
-        rc = axidma_of_parse_dma_name(driver_node, i, &dev->channels[i]);
+        // Parse out the information about the channel
+        rc = axidma_of_parse_channel(dma_node, channel, &dev->channels[i], dev);
         if (rc < 0) {
             return rc;
         }

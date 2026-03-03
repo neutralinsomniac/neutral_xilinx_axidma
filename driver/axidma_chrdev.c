@@ -307,7 +307,7 @@ static int axidma_mmap(struct file *file, struct vm_area_struct *vma)
     // Do not copy this memory region if this process is forked.
     /* TODO: Figure out the proper way to actually handle multiple processes
      * referring to the DMA buffer. */
-    //vma->vm_flags |= VM_DONTCOPY;
+    vm_flags_set(vma, VM_DONTCOPY);
 
     // Add the allocation to the driver's list of DMA buffers
     list_add(&dma_alloc->list, &dev->dmabuf_list);

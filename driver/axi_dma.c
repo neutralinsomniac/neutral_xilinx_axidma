@@ -75,18 +75,7 @@ static int axidma_probe(struct platform_device *pdev)
     axidma_dev->minor_num = minor_num + current_idx;
     axidma_dev->num_devices = 1; // Each probe call handles 1 physical instance
 
-    // Create a unique name: "axidma0", "axidma1", etc.
-    // We allocate space for the base name + digits
-    rc = strlen(chrdev_name) + 10;
-    axidma_dev->chrdev_name = kmalloc(rc, GFP_KERNEL);
-    if (axidma_dev->chrdev_name == NULL) {
-        axidma_err("Unable to allocate the AXI DMA chardev name string.\n");
-        rc = -ENOMEM;
-        goto destroy_dma_dev;
-    }
-
     // Format the name with the unique index
-    snprintf(axidma_dev->chrdev_name, rc, "%s%d", chrdev_name, current_idx);
     axidma_info("Probing AXI DMA instance %d as %s\n", current_idx, axidma_dev->chrdev_name);
 
     // Initialize the character device (registers /dev/axidmaX)
@@ -103,8 +92,6 @@ static int axidma_probe(struct platform_device *pdev)
 
 destroy_dma_dev:
     axidma_dma_exit(axidma_dev);
-    if (axidma_dev->chrdev_name != chrdev_name) // Only free if we allocated it
-        kfree(axidma_dev->chrdev_name);
 free_axidma_dev:
     kfree(axidma_dev);
     return rc;
@@ -122,10 +109,6 @@ static void axidma_remove(struct platform_device *pdev)
 
     // Cleanup the DMA structures
     axidma_dma_exit(axidma_dev);
-
-    // Free the device structure
-    if (axidma_dev->chrdev_index > 0)
-        kfree(axidma_dev->chrdev_name);
 
     kfree(axidma_dev);
     return;
