@@ -180,11 +180,11 @@ free_ext_alloc:
 static int axidma_put_external(struct axidma_device *dev, void *user_addr)
 {
     void *end_user_addr;
-    struct list_head *iter;
+    struct list_head *iter, *temp;
     struct axidma_external_allocation *dma_alloc;
 
     // Find the allocation corresponding to the user address
-    list_for_each(iter, &dev->external_dmabufs)
+    list_for_each_safe(iter, temp, &dev->external_dmabufs)
     {
         dma_alloc = container_of(iter, struct axidma_external_allocation, list);
         end_user_addr = (char *)dma_alloc->user_addr + dma_alloc->size;
@@ -196,7 +196,8 @@ static int axidma_put_external(struct axidma_device *dev, void *user_addr)
             dma_buf_detach(dma_alloc->dma_buf, dma_alloc->dma_attach);
             dma_buf_put(dma_alloc->dma_buf);
 
-            // Free the allocation structure
+            // Remove from list BEFORE freeing, then free the structure
+            list_del(&dma_alloc->list);
             kfree(dma_alloc);
             return 0;
         }
@@ -246,8 +247,42 @@ static int axidma_open(struct inode *inode, struct file *file)
     return 0;
 }
 
+/* Helper to clean up all external DMA buffer registrations */
+static void axidma_cleanup_external_dmabufs(struct axidma_device *dev)
+{
+    struct list_head *iter, *temp;
+    struct axidma_external_allocation *dma_alloc;
+
+    list_for_each_safe(iter, temp, &dev->external_dmabufs)
+    {
+        dma_alloc = container_of(iter, struct axidma_external_allocation, list);
+        dma_buf_unmap_attachment(dma_alloc->dma_attach,
+                dma_alloc->sg_table, DMA_BIDIRECTIONAL);
+        dma_buf_detach(dma_alloc->dma_buf, dma_alloc->dma_attach);
+        dma_buf_put(dma_alloc->dma_buf);
+        list_del(&dma_alloc->list);
+        kfree(dma_alloc);
+    }
+}
+
 static int axidma_release(struct inode *inode, struct file *file)
 {
+    struct axidma_device *dev;
+
+    dev = file->private_data;
+    if (dev != NULL) {
+        /* Stop all in-flight DMA transfers and release task_struct references.
+         * This MUST happen before VMA teardown frees DMA buffers, which is
+         * guaranteed because release() is called before exit_mm(). Using
+         * dmaengine_terminate_sync() ensures no callbacks are in-flight
+         * after this returns. */
+        axidma_dma_stop_all(dev);
+
+        /* Clean up any external DMA buffer registrations that the process
+         * did not explicitly unregister before closing/crashing. */
+        axidma_cleanup_external_dmabufs(dev);
+    }
+
     file->private_data = NULL;
     return 0;
 }
@@ -538,8 +573,9 @@ static long axidma_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         case AXIDMA_STOP_DMA_CHANNEL:
             if (copy_from_user(&chan_info, arg_ptr, sizeof(chan_info)) != 0) {
-                axidma_err("Unable to channel info from userspace for "
+                axidma_err("Unable to copy channel info from userspace for "
                            "AXIDMA_STOP_DMA_CHANNEL.\n");
+                return -EFAULT;
             }
             rc = axidma_stop_channel(dev, &chan_info);
             break;

@@ -143,7 +143,7 @@ struct axidma_residue {
 #define AXIDMA_IOCTL_MAGIC              'W'
 
 // The number of IOCTL's implemented, used for verification
-#define AXIDMA_NUM_IOCTLS               11
+#define AXIDMA_NUM_IOCTLS               12
 
 /**
  * Returns the number of available DMA channels in the system.
@@ -396,6 +396,6 @@ struct axidma_residue {
  * Inputs:
  *  - user_addr - The user virtual address of the external DMA buffer.
  **/
-#define AXIDMA_UNREGISTER_BUFFER        _IO(AXIDMA_IOCTL_MAGIC, 10)
+#define AXIDMA_UNREGISTER_BUFFER        _IO(AXIDMA_IOCTL_MAGIC, 11)
 
 #endif /* AXIDMA_IOCTL_H_ */

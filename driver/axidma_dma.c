@@ -80,20 +80,30 @@ struct axidma_cb_data {
 
 static char *axidma_dir_to_string(enum axidma_dir dma_dir)
 {
-    BUG_ON(dma_dir != AXIDMA_WRITE && dma_dir != AXIDMA_READ);
-    return (dma_dir == AXIDMA_WRITE) ? "transmit" : "receive";
+    WARN_ON_ONCE(dma_dir != AXIDMA_WRITE && dma_dir != AXIDMA_READ);
+    if (dma_dir == AXIDMA_WRITE) {
+        return "transmit";
+    } else if (dma_dir == AXIDMA_READ) {
+        return "receive";
+    }
+    return "unknown";
 }
 
 static char *axidma_type_to_string(enum axidma_type dma_type)
 {
-    BUG_ON(dma_type != AXIDMA_DMA && dma_type != AXIDMA_VDMA);
-    return (dma_type == AXIDMA_DMA) ? "DMA" : "VDMA";
+    WARN_ON_ONCE(dma_type != AXIDMA_DMA && dma_type != AXIDMA_VDMA);
+    if (dma_type == AXIDMA_DMA) {
+        return "DMA";
+    } else if (dma_type == AXIDMA_VDMA) {
+        return "VDMA";
+    }
+    return "unknown";
 }
 
 // Convert the AXI DMA direction enumeration to a DMA direction enumeration
 static enum dma_transfer_direction axidma_to_dma_dir(enum axidma_dir dma_dir)
 {
-    BUG_ON(dma_dir != AXIDMA_WRITE && dma_dir != AXIDMA_READ);
+    WARN_ON_ONCE(dma_dir != AXIDMA_WRITE && dma_dir != AXIDMA_READ);
     return (dma_dir == AXIDMA_WRITE) ? DMA_MEM_TO_DEV : DMA_DEV_TO_MEM;
 }
 
@@ -139,6 +149,23 @@ static struct axidma_chan *axidma_get_chan(struct axidma_device *dev,
     return NULL;
 }
 
+/* Helper to get the array index for a channel in the dev->channels array.
+ * Returns a valid index, or -1 if not found. */
+static int axidma_get_chan_index(struct axidma_device *dev,
+        struct axidma_chan *chan)
+{
+    int index;
+
+    if (chan == NULL || dev->channels == NULL) {
+        return -1;
+    }
+    index = (int)(chan - dev->channels);
+    if (index < 0 || index >= dev->num_chans) {
+        return -1;
+    }
+    return index;
+}
+
 static void axidma_dma_callback(void *data)
 {
     struct axidma_cb_data *cb_data;
@@ -150,13 +177,18 @@ static void axidma_dma_callback(void *data)
     if (cb_data->comp != NULL) {
         complete(cb_data->comp);
     } else if (VALID_NOTIFY_SIGNAL(cb_data->notify_signal)) {
-        clear_siginfo(&sig_info);
-        sig_info.si_signo = cb_data->notify_signal;
-        sig_info.si_code = SI_QUEUE;
-        //sig_info.si_int = cb_data->channel_id;
-        sig_info.si_errno = cb_data->channel_id;    //This shouldn't be here
-        sig_info.si_ptr = cb_data->user_data;
-        send_sig_info(cb_data->notify_signal, &sig_info, cb_data->process);
+        if (cb_data->process != NULL) {
+            clear_siginfo(&sig_info);
+            sig_info.si_signo = cb_data->notify_signal;
+            sig_info.si_code = SI_QUEUE;
+            sig_info.si_errno = cb_data->channel_id;
+            sig_info.si_ptr = cb_data->user_data;
+            send_sig_info(cb_data->notify_signal, &sig_info,
+                          cb_data->process);
+            // Release the task_struct reference taken during transfer setup
+            put_task_struct(cb_data->process);
+            cb_data->process = NULL;
+        }
     }
 }
 
@@ -253,6 +285,11 @@ static int axidma_prep_transfer(struct axidma_chan *axidma_chan,
     } else {
         cb_data->comp = NULL;
         cb_data->notify_signal = dma_tfr->notify_signal;
+        /* Take a reference on the task_struct for async transfers so the
+         * callback can safely send a signal even if the process is exiting. */
+        if (dma_tfr->process != NULL) {
+            get_task_struct(dma_tfr->process);
+        }
         cb_data->process = dma_tfr->process;
         dma_txnd->callback_param = cb_data;
         dma_txnd->callback = axidma_dma_callback;
@@ -262,6 +299,12 @@ static int axidma_prep_transfer(struct axidma_chan *axidma_chan,
         axidma_err("Unable to submit the %s %s transaction to the engine.\n",
                    direction, type);
         rc = -EBUSY;
+        /* If we took a task reference for an async transfer, release it
+         * since the transfer won't complete. */
+        if (dma_tfr->wait_ms <= 0 && cb_data->process != NULL) {
+            put_task_struct(cb_data->process);
+            cb_data->process = NULL;
+        }
         goto stop_dma;
     }
 
@@ -355,10 +398,44 @@ int axidma_set_signal(struct axidma_device *dev, int signal, void *user_data)
     return 0;
 }
 
+/* Stop all DMA channels and release any pending async task_struct references.
+ * This should be called during file release (process exit/close). */
+void axidma_dma_stop_all(struct axidma_device *dev)
+{
+    int i;
+    struct dma_chan *chan;
+    struct axidma_cb_data *cb_data;
+
+    for (i = 0; i < dev->num_chans; i++)
+    {
+        chan = dev->channels[i].chan;
+        if (chan != NULL) {
+            /* Use dmaengine_terminate_sync to ensure no callbacks are running
+             * after this returns. This is safe because we're in process
+             * context (file release). */
+            dmaengine_terminate_sync(chan);
+        }
+
+        /* Release any task_struct references held by pending async callbacks.
+         * After terminate_sync, no more callbacks will fire, so these
+         * references would otherwise leak. */
+        cb_data = &dev->cb_data[i];
+        if (cb_data->comp == NULL && cb_data->process != NULL) {
+            put_task_struct(cb_data->process);
+            cb_data->process = NULL;
+        }
+    }
+
+    // Reset the signal state so stale values don't affect a new opener
+    dev->notify_signal = -1;
+    dev->user_data = NULL;
+}
+
 int axidma_read_transfer(struct axidma_device *dev,
                          struct axidma_transaction *trans)
 {
     int rc;
+    int chan_index;
     struct axidma_chan *rx_chan;
     struct scatterlist sg_list;
     struct axidma_transfer rx_tfr;
@@ -369,6 +446,14 @@ int axidma_read_transfer(struct axidma_device *dev,
         axidma_err("Invalid device id %d for DMA receive channel.\n",
                    trans->channel_id);
         return -ENODEV;
+    }
+
+    // Get the safe array index for cb_data
+    chan_index = axidma_get_chan_index(dev, rx_chan);
+    if (chan_index < 0) {
+        axidma_err("Channel index out of range for channel id %d.\n",
+                   trans->channel_id);
+        return -EINVAL;
     }
 
     // Setup the scatter-gather list for the transfer (only one entry)
@@ -389,7 +474,7 @@ int axidma_read_transfer(struct axidma_device *dev,
     rx_tfr.notify_signal = dev->notify_signal;
     rx_tfr.user_data = dev->user_data;
     rx_tfr.process = get_current();
-    rx_tfr.cb_data = &dev->cb_data[trans->channel_id];
+    rx_tfr.cb_data = &dev->cb_data[chan_index];
 
     // Prepare the receive transfer
     rc = axidma_prep_transfer(rx_chan, &rx_tfr);
@@ -397,6 +482,7 @@ int axidma_read_transfer(struct axidma_device *dev,
         axidma_err("Could not prepare RX transfer chan %d", trans->channel_id);
         return rc;
     }
+
     // Submit the receive transfer, and wait for it to complete
     rc = axidma_start_transfer(rx_chan, &rx_tfr);
     if (rc < 0) {
@@ -410,6 +496,7 @@ int axidma_write_transfer(struct axidma_device *dev,
                           struct axidma_transaction *trans)
 {
     int rc;
+    int chan_index;
     struct axidma_chan *tx_chan;
     struct scatterlist sg_list;
     struct axidma_transfer tx_tfr;
@@ -420,6 +507,14 @@ int axidma_write_transfer(struct axidma_device *dev,
         axidma_err("Invalid device id %d for DMA transmit channel.\n",
                    trans->channel_id);
         return -ENODEV;
+    }
+
+    // Get the safe array index for cb_data
+    chan_index = axidma_get_chan_index(dev, tx_chan);
+    if (chan_index < 0) {
+        axidma_err("Channel index out of range for channel id %d.\n",
+                   trans->channel_id);
+        return -EINVAL;
     }
 
     // Setup the scatter-gather list for the transfer (only one entry)
@@ -440,7 +535,7 @@ int axidma_write_transfer(struct axidma_device *dev,
     tx_tfr.notify_signal = dev->notify_signal;
     tx_tfr.user_data = dev->user_data;
     tx_tfr.process = get_current();
-    tx_tfr.cb_data = &dev->cb_data[trans->channel_id];
+    tx_tfr.cb_data = &dev->cb_data[chan_index];
 
     // Prepare the transmit transfer
     rc = axidma_prep_transfer(tx_chan, &tx_tfr);
@@ -464,6 +559,7 @@ int axidma_rw_transfer(struct axidma_device *dev,
                        struct axidma_inout_transaction *trans)
 {
     int rc;
+    int tx_index, rx_index;
     struct axidma_chan *tx_chan, *rx_chan;
     struct scatterlist tx_sg_list, rx_sg_list;
     struct axidma_transfer tx_tfr, rx_tfr;
@@ -481,6 +577,14 @@ int axidma_rw_transfer(struct axidma_device *dev,
         axidma_err("Invalid device id %d for DMA receive channel.\n",
                    trans->rx_channel_id);
         return -ENODEV;
+    }
+
+    // Get safe array indices for cb_data
+    tx_index = axidma_get_chan_index(dev, tx_chan);
+    rx_index = axidma_get_chan_index(dev, rx_chan);
+    if (tx_index < 0 || rx_index < 0) {
+        axidma_err("Channel index out of range for rw transfer.\n");
+        return -EINVAL;
     }
 
     // Setup the scatter-gather list for the transfers (only one entry)
@@ -507,7 +611,7 @@ int axidma_rw_transfer(struct axidma_device *dev,
     tx_tfr.notify_signal = dev->notify_signal,
     tx_tfr.user_data = dev->user_data,
     tx_tfr.process = get_current(),
-    tx_tfr.cb_data = &dev->cb_data[trans->tx_channel_id];
+    tx_tfr.cb_data = &dev->cb_data[tx_index];
 
     // Add in the frame information for VDMA transfers
     if (tx_chan->type == AXIDMA_VDMA) {
@@ -523,7 +627,7 @@ int axidma_rw_transfer(struct axidma_device *dev,
     rx_tfr.notify_signal = dev->notify_signal,
     rx_tfr.user_data = dev->user_data,
     rx_tfr.process = get_current(),
-    rx_tfr.cb_data = &dev->cb_data[trans->rx_channel_id];
+    rx_tfr.cb_data = &dev->cb_data[rx_index];
 
     // Add in the frame information for VDMA transfers
     if (tx_chan->type == AXIDMA_VDMA) {
@@ -558,6 +662,7 @@ int axidma_video_transfer(struct axidma_device *dev,
                           enum axidma_dir dir)
 {
     int rc, i;
+    int chan_index;
     size_t image_size;
     struct axidma_chan *chan;
     struct scatterlist *sg_list;
@@ -598,11 +703,20 @@ int axidma_video_transfer(struct axidma_device *dev,
     chan = axidma_get_chan(dev, trans->channel_id);
     if (chan == NULL || chan->dir != dir || chan->type != AXIDMA_VDMA) {
         axidma_err("Invalid device id %d for VDMA %s channel.\n",
-                   trans->channel_id, axidma_dir_to_string(chan->dir));
+                   trans->channel_id, axidma_dir_to_string(dir));
         rc = -ENODEV;
         goto free_sg_list;
     }
-    transfer.cb_data = &dev->cb_data[trans->channel_id];
+
+    // Get safe array index for cb_data
+    chan_index = axidma_get_chan_index(dev, chan);
+    if (chan_index < 0) {
+        axidma_err("Channel index out of range for channel id %d.\n",
+                   trans->channel_id);
+        rc = -EINVAL;
+        goto free_sg_list;
+    }
+    transfer.cb_data = &dev->cb_data[chan_index];
 
     // Prepare the transmit transfer
     rc = axidma_prep_transfer(chan, &transfer);
@@ -616,7 +730,7 @@ int axidma_video_transfer(struct axidma_device *dev,
 free_sg_list:
     kfree(transfer.sg_list);
 ret:
-    return 0;
+    return rc;
 }
 
 int axidma_get_residue(struct axidma_device *dev, struct axidma_residue *res)
@@ -639,7 +753,9 @@ int axidma_get_residue(struct axidma_device *dev, struct axidma_residue *res)
 int axidma_stop_channel(struct axidma_device *dev,
                         struct axidma_chan *chan_info)
 {
+    int chan_index;
     struct axidma_chan *chan;
+    struct axidma_cb_data *cb_data;
 
     // Get the transmit and receive channels with the given ids.
     chan = axidma_get_chan(dev, chan_info->channel_id);
@@ -652,7 +768,20 @@ int axidma_stop_channel(struct axidma_device *dev,
     }
 
     // Terminate all DMA transactions on the given channel
-    return dmaengine_terminate_all(chan->chan);
+    dmaengine_terminate_sync(chan->chan);
+
+    /* Release any task_struct reference held by the callback data for this
+     * channel, since the callback will never fire after termination. */
+    chan_index = axidma_get_chan_index(dev, chan);
+    if (chan_index >= 0) {
+        cb_data = &dev->cb_data[chan_index];
+        if (cb_data->comp == NULL && cb_data->process != NULL) {
+            put_task_struct(cb_data->process);
+            cb_data->process = NULL;
+        }
+    }
+
+    return 0;
 }
 
 /*----------------------------------------------------------------------------
@@ -728,10 +857,13 @@ int axidma_dma_init(struct platform_device *pdev, struct axidma_device *dev)
         goto free_channels;
     }
 
+    // Zero-initialize callback data so process pointers start as NULL
+    memset(dev->cb_data, 0, dev->num_chans * elem_size);
+
     // Parse the type and direction of each DMA channel from the device tree
     rc = axidma_of_parse_dma_nodes(pdev, dev);
     if (rc < 0) {
-        return rc;
+        goto free_callback_data;
     }
 
     // Exclusively request all of the channels in the device tree entry
@@ -739,6 +871,10 @@ int axidma_dma_init(struct platform_device *pdev, struct axidma_device *dev)
     if (rc < 0) {
         goto free_callback_data;
     }
+
+    // Initialize signal state
+    dev->notify_signal = -1;
+    dev->user_data = NULL;
 
     axidma_info("DMA: Found %d transmit channels and %d receive channels.\n",
                 dev->num_dma_tx_chans, dev->num_dma_rx_chans);
@@ -762,8 +898,14 @@ void axidma_dma_exit(struct axidma_device *dev)
     for (i = 0; i < dev->num_chans; i++)
     {
         chan = dev->channels[i].chan;
-        dmaengine_terminate_all(chan);
+        dmaengine_terminate_sync(chan);
         dma_release_channel(chan);
+
+        /* Release any remaining task_struct references */
+        if (dev->cb_data[i].comp == NULL && dev->cb_data[i].process != NULL) {
+            put_task_struct(dev->cb_data[i].process);
+            dev->cb_data[i].process = NULL;
+        }
     }
 
     // Free the channel and callback data arrays
