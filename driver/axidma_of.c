@@ -124,23 +124,25 @@ static int axidma_of_parse_channel(struct device_node *dma_node, int channel,
     if (of_find_property(dma_chan_node, "xlnx,device-id", NULL) == NULL) {
         printk(KERN_INFO "inside error case!\n");
         printk(KERN_ERR "DMA channel is missing xlnx,device-id");
-        return -EINVAL;
+        rc = -EINVAL;
+        goto put_chan_node;
     }
 
     rc = of_property_read_u32(dma_chan_node, "xlnx,device-id", &channel_id);
     if (rc < 0) {
         axidma_err("Unable to read the 'xlnx,device-id' property.\n");
-        return -EINVAL;
+        rc = -EINVAL;
+        goto put_chan_node;
     }
     chan->channel_id = channel_id;
 
     // Use the compatible string to determine the channel's information
     rc = axidma_parse_compatible_property(dma_chan_node, chan, dev);
-    if (rc < 0) {
-        return rc;
-    }
 
-    return 0;
+put_chan_node:
+    // of_get_next_child() took a reference on the channel node
+    of_node_put(dma_chan_node);
+    return rc;
 }
 
 static int axidma_check_unique_ids(struct axidma_device *dev)
@@ -267,21 +269,24 @@ int axidma_of_parse_dma_nodes(struct platform_device *pdev,
         if (phandle_args.args_count < 1) {
             printk(KERN_ERR "Phandle %d in the 'dmas' property is "
                             "is missing the channel direciton argument.\n", i);
-            return -EINVAL;
+            rc = -EINVAL;
+            goto put_dma_node;
         } else if (channel != 0 && channel != 1) {
             printk(KERN_ERR "Phandle %d in the 'dmas' property "
                             "has an invalid channel (argument 0).\n", i);
-            return -EINVAL;
+            rc = -EINVAL;
+            goto put_dma_node;
         }
 
         // Parse the name of the channel
         rc = axidma_of_parse_dma_name(driver_node, i, &dev->channels[i]);
         if (rc < 0) {
-            return rc;
+            goto put_dma_node;
         }
 
         // Parse out the information about the channel
         rc = axidma_of_parse_channel(dma_node, channel, &dev->channels[i], dev);
+        of_node_put(dma_node);
         if (rc < 0) {
             return rc;
         }
@@ -289,4 +294,8 @@ int axidma_of_parse_dma_nodes(struct platform_device *pdev,
 
     // Check that all channels have unique channel ID's
     return axidma_check_unique_ids(dev);
+
+put_dma_node:
+    of_node_put(dma_node);
+    return rc;
 }
